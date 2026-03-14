@@ -1,4 +1,4 @@
-FROM --platform=$TARGETPLATFORM golang:1.20 as builder
+FROM --platform=$TARGETPLATFORM golang:1.24 as builder
 WORKDIR /go/src/github.com/koordinator-sh/koordinator
 
 ARG VERSION
@@ -7,7 +7,9 @@ ENV VERSION $VERSION
 ENV GOOS linux
 ENV GOARCH $TARGETARCH
 
-RUN apt update && apt install -y bash build-essential cmake wget
+RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true && \
+    apt update && apt install -y bash build-essential cmake wget
 COPY hack/libpfm-4.13.0.tar.gz ./
 RUN echo "bcb52090f02bc7bcb5ac066494cd55bbd5084e65  libpfm-4.13.0.tar.gz" | sha1sum -c && \
     tar -xzf libpfm-4.13.0.tar.gz && \
@@ -35,7 +37,9 @@ RUN go build -a -o koordlet cmd/koordlet/main.go
 
 FROM --platform=$TARGETPLATFORM nvidia/cuda:11.8.0-base-ubuntu22.04
 WORKDIR /
-RUN apt-get update && apt-get install -y lvm2 iptables pciutils && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|archive.ubuntu.com|mirrors.ustc.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|security.ubuntu.com|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true && \
+    apt-get update && apt-get install -y lvm2 iptables pciutils && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /go/src/github.com/koordinator-sh/koordinator/koordlet .
 COPY --from=builder /usr/local/lib /usr/lib
 ENTRYPOINT ["/koordlet"]

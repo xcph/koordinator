@@ -23,17 +23,21 @@ import (
 
 	topov1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
 	"k8s.io/utils/ptr"
 
 	"github.com/koordinator-sh/koordinator/apis/extension"
 	"github.com/koordinator-sh/koordinator/pkg/features"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/cpusetalloc"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/metrics"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/protocol"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/statesinformer"
 	koordletutil "github.com/koordinator-sh/koordinator/pkg/koordlet/util"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/util/kubelet"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/util/system"
 	"github.com/koordinator-sh/koordinator/pkg/util"
-	"github.com/koordinator-sh/koordinator/pkg/util/cpuset"
 )
 
 type cpusetRule struct {
@@ -41,6 +45,9 @@ type cpusetRule struct {
 	sharePools      []extension.CPUSharedPool
 	beSharePools    []extension.CPUSharedPool
 	systemQOSCPUSet string
+	// m+n allocation
+	mPlusNAllocator *cpusetalloc.Allocator
+	strategy        *extension.CPUExclusiveSharedStrategy
 	// TODO: support per-node disable
 }
 
@@ -57,6 +64,27 @@ func (r *cpusetRule) getContainerCPUSet(containerReq *protocol.ContainerRequest)
 	}
 	podAnnotations := containerReq.PodAnnotations
 	podLabels := containerReq.PodLabels
+
+	// m+n allocation: pod with cpu-exclusive-cores gets m dedicated + n shared
+	if m, ok := extension.GetPodCPUExclusiveCores(podAnnotations); ok && r.mPlusNAllocator != nil {
+		n := int32(0)
+		if nVal, hasN := extension.GetPodCPUSharedCores(podAnnotations); hasN {
+			n = nVal
+		} else if r.strategy != nil {
+			n = r.strategy.SharedCores
+		}
+		if cpusetVal, err := r.mPlusNAllocator.Allocate(types.UID(containerReq.PodMeta.UID), int(m), int(n)); err != nil {
+			klog.V(4).Infof("m+n allocator failed for container %v/%v: %v",
+				containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, err)
+			return nil, err
+		} else if cpusetVal.Size() > 0 {
+			s := cpusetVal.String()
+			klog.V(6).Infof("get cpuset from m+n allocator for container %v/%v: %v",
+				containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, s)
+			return ptr.To[string](s), nil
+		}
+	}
+
 	podAlloc, err := extension.GetResourceStatus(podAnnotations)
 	if err != nil {
 		return nil, err
@@ -214,11 +242,42 @@ func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
 	metrics.RecordCPUSetSharePoolCores(float64(shareCPUSetCount))
 	metrics.RecordCPUSetBESharePoolCores(float64(beShareCPUSetCount))
 
+	var mPlusNAlloc *cpusetalloc.Allocator
+	var strategy *extension.CPUExclusiveSharedStrategy
+	if strat, ok := extension.ParseNodeCPUExclusiveSharedStrategy(nodeTopo.Annotations); ok {
+		strategy = strat
+		extTopo, err := extension.GetCPUTopology(nodeTopo.Annotations)
+		if err != nil {
+			klog.V(4).Infof("m+n: failed to get cpu topology: %v", err)
+		} else if extTopo != nil && len(extTopo.Detail) > 0 {
+			topo := kubelet.NewCPUTopologyFromExtension(extTopo)
+			allCPUList := make([]int, 0, len(extTopo.Detail))
+			for _, c := range extTopo.Detail {
+				allCPUList = append(allCPUList, int(c.ID))
+			}
+			allCPUsSet := cpuset.New(allCPUList...)
+			sharedSet := cpuset.New()
+			for _, pool := range cpuSharePools {
+				poolSet, err := cpuset.Parse(pool.CPUSet)
+				if err != nil {
+					continue
+				}
+				sharedSet = sharedSet.Union(poolSet)
+			}
+			dedicatedSet := allCPUsSet.Difference(sharedSet)
+			checkpointPath := kubelet.GetCPUSetMPlusNStateFilePath(system.Conf.VarLibKubeletRootDir)
+			mPlusNAlloc = cpusetalloc.NewAllocator(dedicatedSet, sharedSet, topo, checkpointPath)
+			klog.V(4).Infof("m+n allocator created: dedicated %v, shared %v", dedicatedSet.String(), sharedSet.String())
+		}
+	}
+
 	newRule := &cpusetRule{
 		kubeletPolicy:   *cpuManagerPolicy,
 		sharePools:      cpuSharePools,
 		beSharePools:    beCPUSharePools,
 		systemQOSCPUSet: systemQOSCPUSet,
+		mPlusNAllocator: mPlusNAlloc,
+		strategy:        strategy,
 	}
 	updated := p.updateRule(newRule)
 	return updated, nil
@@ -228,6 +287,16 @@ func (p *cpusetPlugin) ruleUpdateCb(target *statesinformer.CallbackTarget) error
 	if target == nil {
 		klog.Warningf("callback target is nil")
 		return nil
+	}
+	// release m+n allocations for removed pods
+	if r := p.getRule(); r != nil && r.mPlusNAllocator != nil {
+		keepUIDs := make(map[types.UID]struct{})
+		for _, podMeta := range target.Pods {
+			if _, ok := extension.GetPodCPUExclusiveCores(podMeta.Pod.Annotations); ok {
+				keepUIDs[types.UID(podMeta.Pod.UID)] = struct{}{}
+			}
+		}
+		r.mPlusNAllocator.ReleaseStale(keepUIDs)
 	}
 	for _, podMeta := range target.Pods {
 		allContainersSpec := make(map[string]*corev1.Container, len(podMeta.Pod.Spec.Containers)+len(podMeta.Pod.Spec.InitContainers))

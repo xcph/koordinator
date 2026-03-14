@@ -34,8 +34,33 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/stats/pidlimit"
 	"k8s.io/utils/cpuset"
 
+	"github.com/koordinator-sh/koordinator/apis/extension"
 	koordletutil "github.com/koordinator-sh/koordinator/pkg/koordlet/util"
 )
+
+// NewCPUTopologyFromExtension converts extension.CPUTopology to k8s topology.CPUTopology for TakeByTopology.
+func NewCPUTopologyFromExtension(ext *extension.CPUTopology) *topology.CPUTopology {
+	if ext == nil || len(ext.Detail) == 0 {
+		return nil
+	}
+	cpuDetails := topology.CPUDetails{}
+	sockets, cores := make(map[int]struct{}), make(map[int]struct{})
+	for _, c := range ext.Detail {
+		cpuDetails[int(c.ID)] = topology.CPUInfo{
+			NUMANodeID: int(c.Node),
+			SocketID:   int(c.Socket),
+			CoreID:     int(c.Core),
+		}
+		sockets[int(c.Socket)] = struct{}{}
+		cores[int(c.Core)] = struct{}{}
+	}
+	return &topology.CPUTopology{
+		NumCPUs:    len(ext.Detail),
+		NumCores:   len(cores),
+		NumSockets: len(sockets),
+		CPUDetails: cpuDetails,
+	}
+}
 
 func NewCPUTopology(cpuInfo *koordletutil.LocalCPUInfo) *topology.CPUTopology {
 	cpuTopology := &topology.CPUTopology{
@@ -262,4 +287,9 @@ func hardEvictionReservation(thresholds []evictionapi.Threshold, capacity corev1
 
 func GetCPUManagerStateFilePath(rootDirectory string) string {
 	return filepath.Join(rootDirectory, "cpu_manager_state")
+}
+
+// GetCPUSetMPlusNStateFilePath returns the path for m+n cpuset allocator checkpoint.
+func GetCPUSetMPlusNStateFilePath(rootDirectory string) string {
+	return filepath.Join(rootDirectory, "cpuset_m_plus_n_state")
 }

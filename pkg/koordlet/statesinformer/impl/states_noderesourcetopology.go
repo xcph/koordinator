@@ -386,6 +386,10 @@ func (s *nodeTopoInformer) calcNodeTopo() (*nodeTopologyStatus, error) {
 	if len(systemQOSJson) != 0 {
 		nodeTopoStatus.Annotations[extension.AnnotationNodeSystemQOSResource] = string(systemQOSJson)
 	}
+	// sync m+n strategy from node label to NRT annotations for cpuset rule
+	if s := node.Labels[extension.LabelNodeCPUExclusiveSharedStrategy]; s != "" {
+		nodeTopoStatus.Annotations[extension.LabelNodeCPUExclusiveSharedStrategy] = s
+	}
 
 	klog.V(6).Infof("calculate node topology status: %+v", nodeTopoStatus)
 	return nodeTopoStatus, nil
@@ -636,6 +640,7 @@ func isEqualNRTAnnotations(oldAnno, newAnno map[string]string) (bool, string) {
 		extension.AnnotationNodeCPUAllocs,
 		extension.AnnotationNodeReservation,
 		extension.AnnotationNodeSystemQOSResource,
+		extension.LabelNodeCPUExclusiveSharedStrategy,
 	}
 	for _, key := range keys {
 		oldValue, oldExist := oldAnno[key]
@@ -648,6 +653,14 @@ func isEqualNRTAnnotations(oldAnno, newAnno map[string]string) (bool, string) {
 			// (oldExist = true, newExist = false) OR (oldExist = false, newExist = true), node topo not equal
 			return false, key
 		} // else both exist in new and old, compare value
+
+		// plain string annotation (e.g. "40:1+30")
+		if key == extension.LabelNodeCPUExclusiveSharedStrategy {
+			if oldValue != newValue {
+				return false, key
+			}
+			continue
+		}
 
 		err := json.Unmarshal([]byte(oldValue), &oldData)
 		if err != nil {

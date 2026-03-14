@@ -18,6 +18,7 @@ package extension
 
 import (
 	"encoding/json"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,6 +58,16 @@ const (
 
 	// LabelNUMATopologyPolicy represents that how to align resource allocation according to the NUMA topology
 	LabelNUMATopologyPolicy = NodeDomainPrefix + "/numa-topology-policy"
+
+	// AnnotationCPUExclusiveCores (m) enables m+n CPU allocation in koordlet.
+	// When set with AnnotationCPUSharedCores or node strategy, container gets m dedicated + n shared cpuset.
+	AnnotationCPUExclusiveCores = SchedulingDomainPrefix + "/cpu-exclusive-cores"
+	// AnnotationCPUSharedCores (n) is the shared cores count for m+n allocation.
+	// When unset, n comes from node label LabelNodeCPUExclusiveSharedStrategy (e.g. "40:1+30").
+	AnnotationCPUSharedCores = SchedulingDomainPrefix + "/cpu-shared-cores"
+	// LabelNodeCPUExclusiveSharedStrategy configures m+n per node, format "x:m+n" (e.g. "40:1+30").
+	// x=instanceCap, m=dedicatedCores, n=sharedCores per instance. Also used in NRT annotations.
+	LabelNodeCPUExclusiveSharedStrategy = NodeDomainPrefix + "/cpu-exclusive-shared-strategy"
 )
 
 // ResourceSpec describes extra attributes of the resource requirements.
@@ -376,4 +387,53 @@ func SetNodeNUMATopologyPolicy(obj metav1.Object, policy NUMATopologyPolicy) {
 	labels[LabelNUMATopologyPolicy] = string(policy)
 	obj.SetLabels(labels)
 	return
+}
+
+// CPUExclusiveSharedStrategy describes m+n allocation: m dedicated + n shared cores per instance.
+type CPUExclusiveSharedStrategy struct {
+	InstanceCap    int32 // max instances on node
+	DedicatedCores int32 // m
+	SharedCores    int32 // n
+}
+
+// ParseNodeCPUExclusiveSharedStrategy parses "x:m+n" from labels or annotations (e.g. "40:1+30").
+func ParseNodeCPUExclusiveSharedStrategy(labelsOrAnnotations map[string]string) (*CPUExclusiveSharedStrategy, bool) {
+	s := labelsOrAnnotations[LabelNodeCPUExclusiveSharedStrategy]
+	if s == "" {
+		return nil, false
+	}
+	var cap, m, n int32
+	if _, err := fmt.Sscanf(s, "%d:%d+%d", &cap, &m, &n); err != nil {
+		return nil, false
+	}
+	if cap <= 0 || m <= 0 || n < 0 {
+		return nil, false
+	}
+	return &CPUExclusiveSharedStrategy{InstanceCap: cap, DedicatedCores: m, SharedCores: n}, true
+}
+
+// GetPodCPUExclusiveCores returns m from pod annotation.
+func GetPodCPUExclusiveCores(podAnnotations map[string]string) (int32, bool) {
+	s := podAnnotations[AnnotationCPUExclusiveCores]
+	if s == "" {
+		return 0, false
+	}
+	var v int32
+	if _, err := fmt.Sscanf(s, "%d", &v); err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// GetPodCPUSharedCores returns n from pod annotation.
+func GetPodCPUSharedCores(podAnnotations map[string]string) (int32, bool) {
+	s := podAnnotations[AnnotationCPUSharedCores]
+	if s == "" {
+		return 0, false
+	}
+	var v int32
+	if _, err := fmt.Sscanf(s, "%d", &v); err != nil || v < 0 {
+		return 0, false
+	}
+	return v, true
 }
