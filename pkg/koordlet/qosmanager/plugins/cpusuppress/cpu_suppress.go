@@ -358,6 +358,46 @@ func (r *CPUSuppress) adjustByCPUSet(cpusetQuantity *resource.Quantity, nodeCPUI
 		}
 	}
 
+	// For LSR/LSE pods without resource-status annotation (e.g. m+n allocated by cpuset rule),
+	// read cpuset from cgroup so BE suppress excludes their CPUs.
+	// This avoids BE overlapping with LSR dedicated/shared cores.
+	for _, podMeta := range podMetas {
+		qos := apiext.GetPodQoSClassRaw(podMeta.Pod)
+		if qos != apiext.QoSLSR && qos != apiext.QoSLSE {
+			continue
+		}
+		if alloc, err := apiext.GetResourceStatus(podMeta.Pod.Annotations); err == nil && alloc != nil && alloc.CPUSet != "" {
+			// already have resource-status with cpuset from annotation
+			continue
+		}
+		if podMeta.Pod == nil || len(podMeta.Pod.Status.ContainerStatuses) == 0 {
+			continue
+		}
+		podCpuset := cpuset.NewCPUSet()
+		for i := range podMeta.Pod.Status.ContainerStatuses {
+			cs := &podMeta.Pod.Status.ContainerStatuses[i]
+			if cs.ContainerID == "" {
+				continue
+			}
+			containerDir, err := koordletutil.GetContainerCgroupParentDir(podMeta.CgroupDir, cs)
+			if err != nil {
+				klog.V(5).Infof("failed to get cgroup dir for pod %s container %s: %v", podMeta.Key(), cs.Name, err)
+				continue
+			}
+			cpuSet, err := r.cgroupReader.ReadCPUSet(containerDir)
+			if err != nil || cpuSet == nil || cpuSet.Size() == 0 {
+				continue
+			}
+			podCpuset = podCpuset.Union(*cpuSet)
+		}
+		if podCpuset.Size() > 0 {
+			for _, cpuID := range podCpuset.ToSliceNoSort() {
+				cpuIdToPool[int32(cpuID)] = qos
+			}
+			klog.V(5).Infof("cpu_suppress: LSR/LSE pod %s cpuset from cgroup: %v", podMeta.Key(), podCpuset.String())
+		}
+	}
+
 	topo := r.statesInformer.GetNodeTopo()
 	if topo == nil {
 		klog.Errorf("node topo is nil")
@@ -376,9 +416,20 @@ func (r *CPUSuppress) adjustByCPUSet(cpusetQuantity *resource.Quantity, nodeCPUI
 		klog.Warningf("get system qos exclusive cpuset failed, error: %v", err)
 	}
 
+	// Build shared pool cpuset from NRT (cpu-shared-pools). LSR shared cores can be used by BE.
+	sharedPoolCPUSet := cpuset.NewCPUSet()
+	if pools, err := apiext.GetNodeCPUSharePools(topo.Annotations); err == nil {
+		for _, p := range pools {
+			if set, err := cpuset.Parse(p.CPUSet); err == nil {
+				sharedPoolCPUSet = sharedPoolCPUSet.Union(set)
+			}
+		}
+	}
+
+	// lsrCpus = LSR dedicated only (excluded from BE). lsCpus = BE-available (LSR shared + non-LSR non-LSE).
+	// LSR shared cores (in shared pool) can be used by BE; LSR dedicated cores cannot.
 	var lsrCpus []koordletutil.ProcessorInfo
 	var lsCpus []koordletutil.ProcessorInfo
-	// FIXME: be pods might be starved since lse pods can run out of all cpus
 	for _, processor := range nodeCPUInfo.ProcessorInfos {
 		cpuCoreID := cpuset.NewCPUSet(int(processor.CPUID))
 		if cpuCoreID.IsSubsetOf(cpusetReserved) || cpuCoreID.IsSubsetOf(exclusiveSystemQOSCPUSet) {
@@ -386,7 +437,11 @@ func (r *CPUSuppress) adjustByCPUSet(cpusetQuantity *resource.Quantity, nodeCPUI
 		}
 
 		if cpuIdToPool[processor.CPUID] == apiext.QoSLSR {
-			lsrCpus = append(lsrCpus, processor)
+			if cpuCoreID.IsSubsetOf(sharedPoolCPUSet) {
+				lsCpus = append(lsCpus, processor) // LSR shared: BE can use
+			} else {
+				lsrCpus = append(lsrCpus, processor) // LSR dedicated: BE must not use
+			}
 		} else if cpuIdToPool[processor.CPUID] != apiext.QoSLSE {
 			lsCpus = append(lsCpus, processor)
 		}
@@ -402,13 +457,14 @@ func (r *CPUSuppress) adjustByCPUSet(cpusetQuantity *resource.Quantity, nodeCPUI
 		cpus = int32(len(oldCPUSet)) + beMaxIncreaseCpuNum
 	}
 	var beCPUSet []int32
-	lsrCpuNums := int32(int(cpus) * len(lsrCpus) / (len(lsrCpus) + len(lsCpus)))
+	// LSR dedicated (lsrCpus) excluded: BE gets 0 from lsrCpus. BE only from lsCpus (LSR shared + others).
+	lsrCpuNums := int32(0)
 
 	if lsrCpuNums > 0 {
 		beCPUSetFromLSR := calculateBESuppressCPUSetPolicy(lsrCpuNums, lsrCpus)
 		beCPUSet = append(beCPUSet, beCPUSetFromLSR...)
 	}
-	if cpus-lsrCpuNums > 0 {
+	if cpus-lsrCpuNums > 0 && len(lsCpus) > 0 {
 		beCPUSetFromLS := calculateBESuppressCPUSetPolicy(cpus-lsrCpuNums, lsCpus)
 		beCPUSet = append(beCPUSet, beCPUSetFromLS...)
 	}

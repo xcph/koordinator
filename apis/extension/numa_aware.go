@@ -19,6 +19,7 @@ package extension
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,10 +64,15 @@ const (
 	// When set with AnnotationCPUSharedCores or node strategy, container gets m dedicated + n shared cpuset.
 	AnnotationCPUExclusiveCores = SchedulingDomainPrefix + "/cpu-exclusive-cores"
 	// AnnotationCPUSharedCores (n) is the shared cores count for m+n allocation.
-	// When unset, n comes from node label LabelNodeCPUExclusiveSharedStrategy (e.g. "40:1+30").
+	// When unset, n comes from node annotation LabelNodeCPUExclusiveSharedStrategy (e.g. "40:1+30").
 	AnnotationCPUSharedCores = SchedulingDomainPrefix + "/cpu-shared-cores"
-	// LabelNodeCPUExclusiveSharedStrategy configures m+n per node, format "x:m+n" (e.g. "40:1+30").
+	// LabelNodeCPUExclusiveSharedStrategy configures m+n per node via node.Annotations. Formats: "x:m+n" (whole-node) or "0:x0:m0+n0,1:x1:m1+n1,..." (per-NUMA).
 	// x=instanceCap, m=dedicatedCores, n=sharedCores per instance. Also used in NRT annotations.
+	//
+	// Multi-pool round-robin: when sharedTotal=(totalCPUs - x*m) and numPools=sharedTotal/n > 1,
+	// shared cores are split into numPools of n cores each. Instances are assigned to pools in
+	// round-robin for load balancing (e.g. 120 cores, 20:4+8 -> 80 dedicated, 40 shared, 5 pools,
+	// 20 instances -> 4 instances per pool, each container gets 4 dedicated + 8 shared = 12 cores).
 	LabelNodeCPUExclusiveSharedStrategy = NodeDomainPrefix + "/cpu-exclusive-shared-strategy"
 )
 
@@ -391,17 +397,55 @@ func SetNodeNUMATopologyPolicy(obj metav1.Object, policy NUMATopologyPolicy) {
 
 // CPUExclusiveSharedStrategy describes m+n allocation: m dedicated + n shared cores per instance.
 type CPUExclusiveSharedStrategy struct {
-	InstanceCap    int32 // max instances on node
+	InstanceCap    int32 // max instances on node (or per NUMA when PerNUMA)
 	DedicatedCores int32 // m
 	SharedCores    int32 // n
 }
 
-// ParseNodeCPUExclusiveSharedStrategy parses "x:m+n" from labels or annotations (e.g. "40:1+30").
-func ParseNodeCPUExclusiveSharedStrategy(labelsOrAnnotations map[string]string) (*CPUExclusiveSharedStrategy, bool) {
+// ParsedCPUExclusiveSharedStrategy is the result of ParseNodeCPUExclusiveSharedStrategy.
+// Exactly one of WholeNode or PerNUMA is set.
+type ParsedCPUExclusiveSharedStrategy struct {
+	// WholeNode is set when using legacy format "x:m+n" (whole-node).
+	WholeNode *CPUExclusiveSharedStrategy
+	// PerNUMA is set when using per-NUMA format "0:x0:m0+n0,1:x1:m1+n1,...".
+	// Key is NUMA node ID.
+	PerNUMA map[int32]*CPUExclusiveSharedStrategy
+}
+
+// ParseNodeCPUExclusiveSharedStrategy parses cpuExclusiveSharedStrategy from labels or annotations.
+//
+// Supported formats:
+//   - Legacy (whole-node): "x:m+n" (e.g. "20:4+8"). x=instanceCap, m=dedicatedCores, n=sharedCores.
+//   - Per-NUMA: "0:x0:m0+n0,1:x1:m1+n1,..." (e.g. "0:8:4+8,1:8:4+8"). Each NUMA gets its own instanceCap and m+n.
+func ParseNodeCPUExclusiveSharedStrategy(labelsOrAnnotations map[string]string) (*ParsedCPUExclusiveSharedStrategy, bool) {
 	s := labelsOrAnnotations[LabelNodeCPUExclusiveSharedStrategy]
 	if s == "" {
 		return nil, false
 	}
+	// Try per-NUMA format: "0:x0:m0+n0" or "0:x0:m0+n0,1:x1:m1+n1,..."
+	// Distinguish from legacy "x:m+n" by 4 fields (numa:x:m+n) vs 3 fields (x:m+n).
+	perNUMA := make(map[int32]*CPUExclusiveSharedStrategy)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		var numaID, cap, m, n int32
+		if nScanned, err := fmt.Sscanf(part, "%d:%d:%d+%d", &numaID, &cap, &m, &n); err != nil || nScanned != 4 {
+			// Not per-NUMA, fall through to legacy
+			perNUMA = nil
+			break
+		}
+		if numaID < 0 || cap <= 0 || m <= 0 || n < 0 {
+			perNUMA = nil
+			break
+		}
+		perNUMA[numaID] = &CPUExclusiveSharedStrategy{InstanceCap: cap, DedicatedCores: m, SharedCores: n}
+	}
+	if len(perNUMA) > 0 {
+		return &ParsedCPUExclusiveSharedStrategy{PerNUMA: perNUMA}, true
+	}
+	// Legacy whole-node format: "x:m+n"
 	var cap, m, n int32
 	if _, err := fmt.Sscanf(s, "%d:%d+%d", &cap, &m, &n); err != nil {
 		return nil, false
@@ -409,7 +453,9 @@ func ParseNodeCPUExclusiveSharedStrategy(labelsOrAnnotations map[string]string) 
 	if cap <= 0 || m <= 0 || n < 0 {
 		return nil, false
 	}
-	return &CPUExclusiveSharedStrategy{InstanceCap: cap, DedicatedCores: m, SharedCores: n}, true
+	return &ParsedCPUExclusiveSharedStrategy{
+		WholeNode: &CPUExclusiveSharedStrategy{InstanceCap: cap, DedicatedCores: m, SharedCores: n},
+	}, true
 }
 
 // GetPodCPUExclusiveCores returns m from pod annotation.

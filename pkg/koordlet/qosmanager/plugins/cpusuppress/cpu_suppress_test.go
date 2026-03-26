@@ -1788,6 +1788,7 @@ func Test_cpuSuppress_adjustByCPUSet_withCPUsReservedFromNodeAnno(t *testing.T) 
 		wantCPUSet string
 	}{
 		{ // total - node.anno.reserv - LSE.used > be.quantity, just select enough cpus to modify cgroup.
+			// LSR dedicated (0,6) excluded; LSE (7) excluded; reserved (3) excluded. BE gets from lsCpus (1,2,4,5).
 			name: "test scale by cpuset and ensure there is enough cpu available for bepod.",
 			args: args{
 				cpusetQuantity:   resource.NewQuantity(3, resource.DecimalSI),
@@ -1795,7 +1796,7 @@ func Test_cpuSuppress_adjustByCPUSet_withCPUsReservedFromNodeAnno(t *testing.T) 
 				oldCPUSets:       "7,6,3,2",
 				nodeResourceTopo: genNodeResourceTopo(`{"reservedCPUs":"3"}`),
 			},
-			wantCPUSet: "0,4-5",
+			wantCPUSet: "1,4-5",
 		},
 		{ // total - node.anno.reserv - LSE.used < be.quantity, do nothing
 			name: "test scale by cpuset and cpus that bepod can used less than bepod needed.",
@@ -1880,6 +1881,7 @@ func Test_cpuSuppress_adjustByCPUSet_withSystemQOSResourceFromNodeAnno(t *testin
 		wantCPUSet string
 	}{
 		{ // total - node.anno.reserv - LSE.used > be.quantity, just select enough cpus to modify cgroup.
+			// LSR dedicated (0,6) excluded; LSE (7) excluded; system QOS (3) excluded. BE gets from lsCpus (1,2,4,5).
 			name: "test scale by cpuset and ensure there is enough cpu available for bepod.",
 			args: args{
 				cpusetQuantity:   resource.NewQuantity(3, resource.DecimalSI),
@@ -1887,7 +1889,7 @@ func Test_cpuSuppress_adjustByCPUSet_withSystemQOSResourceFromNodeAnno(t *testin
 				oldCPUSets:       "7,6,3,2",
 				nodeResourceTopo: genNodeTopoWithSystemQOSRes(`{"cpuset":"3"}`),
 			},
-			wantCPUSet: "0,4-5",
+			wantCPUSet: "1,4-5",
 		},
 		{ // total - node.anno.reserv - LSE.used < be.quantity, do nothing
 			name: "test scale by cpuset and cpus that be pod can used less than be pod needed. there is nothing to do because the cpu runs out",

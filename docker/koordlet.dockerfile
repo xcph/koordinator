@@ -6,6 +6,7 @@ ARG TARGETARCH
 ENV VERSION $VERSION
 ENV GOOS linux
 ENV GOARCH $TARGETARCH
+ENV GOPROXY=https://goproxy.cn,direct
 
 RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true && \
@@ -38,6 +39,7 @@ RUN go build -a -o koordlet cmd/koordlet/main.go
 FROM --platform=$TARGETPLATFORM nvidia/cuda:11.8.0-base-ubuntu22.04
 WORKDIR /
 RUN sed -i 's|archive.ubuntu.com|mirrors.ustc.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|ports.ubuntu.com|mirrors.ustc.edu.cn|g' /etc/apt/sources.list && \
     sed -i 's|security.ubuntu.com|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true && \
     apt-get update && apt-get install -y lvm2 iptables pciutils && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /go/src/github.com/koordinator-sh/koordinator/koordlet .

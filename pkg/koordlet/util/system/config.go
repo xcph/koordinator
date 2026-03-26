@@ -41,6 +41,7 @@ type Config struct {
 	ProcRootDir           string
 	VarRunRootDir         string
 	VarLibKubeletRootDir  string
+	CpusetCheckpointDir   string // Dir for m+n checkpoint. Default /var/lib/koordlet (writable). Empty = use VarLibKubeletRootDir.
 	RunRootDir            string
 	RuntimeHooksConfigDir string
 
@@ -91,6 +92,7 @@ func NewHostModeConfig() *Config {
 		SysFSRootDir:                 "/sys/fs/",
 		VarRunRootDir:                "/var/run/",
 		VarLibKubeletRootDir:         "/var/lib/kubelet/",
+		CpusetCheckpointDir:          "/var/lib/koordlet",
 		RunRootDir:                   "/run/",
 		RuntimeHooksConfigDir:        "/etc/runtime/hookserver.d",
 		DefaultRuntimeType:           "containerd",
@@ -109,6 +111,7 @@ func NewDsModeConfig() *Config {
 		SysFSRootDir:                 "/host-sys-fs/",
 		VarRunRootDir:                "/host-var-run/",
 		VarLibKubeletRootDir:         "/var/lib/kubelet/",
+		CpusetCheckpointDir:          "/var/lib/koordlet",
 		RunRootDir:                   "/host-run/",
 		RuntimeHooksConfigDir:        "/host-etc-hookserver/",
 		DefaultRuntimeType:           "containerd",
@@ -122,6 +125,14 @@ func SetConf(config Config) {
 	Conf = &config
 }
 
+// GetCpusetCheckpointRoot returns the root dir for m+n checkpoint. When CpusetCheckpointDir is set (e.g. when /var/lib/kubelet is read-only), use it; else VarLibKubeletRootDir.
+func (c *Config) GetCpusetCheckpointRoot() string {
+	if c.CpusetCheckpointDir != "" {
+		return c.CpusetCheckpointDir
+	}
+	return c.VarLibKubeletRootDir
+}
+
 func (c *Config) InitFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.CgroupRootDir, "cgroup-root-dir", c.CgroupRootDir, "Cgroup root dir")
 	fs.StringVar(&c.SysRootDir, "sys-root-dir", c.SysRootDir, "host /sys dir in container")
@@ -129,6 +140,7 @@ func (c *Config) InitFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ProcRootDir, "proc-root-dir", c.ProcRootDir, "host /proc dir in container")
 	fs.StringVar(&c.VarRunRootDir, "var-run-root-dir", c.VarRunRootDir, "host /var/run dir in container")
 	fs.StringVar(&c.VarLibKubeletRootDir, "var-lib-kubelet-dir", c.VarLibKubeletRootDir, "host /var/lib/kubelet dir in container")
+	fs.StringVar(&c.CpusetCheckpointDir, "cpuset-checkpoint-dir", c.CpusetCheckpointDir, "writable dir for m+n checkpoint (default /var/lib/koordlet). Empty = use var-lib-kubelet-dir")
 	fs.StringVar(&c.RunRootDir, "run-root-dir", c.RunRootDir, "host /run dir in container")
 
 	fs.StringVar(&c.ContainerdEndPoint, "containerd-endpoint", c.ContainerdEndPoint, "containerd endPoint")

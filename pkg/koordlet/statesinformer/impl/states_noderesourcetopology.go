@@ -48,12 +48,14 @@ import (
 	"github.com/koordinator-sh/koordinator/apis/extension"
 	"github.com/koordinator-sh/koordinator/pkg/features"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/metriccache"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/resourceexecutor"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/statesinformer"
 	koordletutil "github.com/koordinator-sh/koordinator/pkg/koordlet/util"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/util/kubelet"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/util/system"
 	"github.com/koordinator-sh/koordinator/pkg/util"
 	"github.com/koordinator-sh/koordinator/pkg/util/cpuset"
+	k8scpuset "k8s.io/utils/cpuset"
 )
 
 const (
@@ -341,6 +343,18 @@ func (s *nodeTopoInformer) calcNodeTopo() (*nodeTopologyStatus, error) {
 		return nil, fmt.Errorf("failed to marshal system qos resource, error %v", err)
 	}
 
+	// Merge LSR/LSE pod cpusets from cgroup (e.g. m+n allocated by cpuset rule),
+	// since they may not have resource-status annotation or kubelet checkpoint.
+	if cgroupAllocs := s.calLSRLSECPUsFromCgroup(); len(cgroupAllocs) > 0 {
+		if podAllocs == nil {
+			podAllocs = []extension.PodCPUAlloc{}
+		}
+		podAllocs = append(podAllocs, cgroupAllocs...)
+		sort.Slice(podAllocs, func(i, j int) bool {
+			return string(podAllocs[i].UID) < string(podAllocs[j].UID)
+		})
+	}
+
 	// "null" when the podAllocs is empty
 	podAllocsJSON, err := json.Marshal(podAllocs)
 	if err != nil {
@@ -350,6 +364,68 @@ func (s *nodeTopoInformer) calcNodeTopo() (*nodeTopologyStatus, error) {
 	cpuTopologyJSON, err := json.Marshal(cpuTopology)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal cpu topology of node, err: %v", err)
+	}
+
+	// Exclude m+n dedicated cores from LS share pool so cpuset rule fallback gets correct sharedSet.
+	// Otherwise cpuSharePools may include all allocatable CPUs, causing dedicatedSet=empty in fallback
+	// and allocator created with empty sharedPool (allocate fails: "not enough shared CPUs: have 0").
+	if strat, ok := extension.ParseNodeCPUExclusiveSharedStrategy(node.Annotations); ok {
+		if strat.WholeNode != nil {
+			s := strat.WholeNode
+			nodeAnnoReserved, _ := cpuset.Parse(reserved.ReservedCPUs)
+			allCPUs := k8scpuset.New()
+			for cpuID := range sharedPoolCPUs {
+				allCPUs = allCPUs.Union(k8scpuset.New(int(cpuID)))
+			}
+			allocatableCPUs := allCPUs
+			if nodeAnnoReserved.Size() > 0 {
+				reservedK8s, _ := k8scpuset.Parse(reserved.ReservedCPUs)
+				allocatableCPUs = allCPUs.Difference(reservedK8s)
+			}
+			dedicatedTotal := int(s.InstanceCap * s.DedicatedCores)
+			sharedTotal := allocatableCPUs.Size() - dedicatedTotal
+			n := int(s.SharedCores)
+			if dedicatedTotal > 0 && sharedTotal > 0 && n > 0 && sharedTotal >= n {
+				dedicatedSet, err := kubelet.TakeByTopology(allocatableCPUs, dedicatedTotal, topo)
+				if err == nil && dedicatedSet.Size() > 0 {
+					for _, cpuID := range dedicatedSet.UnsortedList() {
+						delete(sharedPoolCPUs, int32(cpuID))
+					}
+					klog.V(5).Infof("excluded m+n dedicated %v from LS share pool", dedicatedSet.String())
+				}
+			}
+		}
+		// Per-NUMA: exclude each NUMA's dedicated from sharedPoolCPUs (same logic per NUMA)
+		if strat.PerNUMA != nil {
+			nodeAnnoReserved, _ := cpuset.Parse(reserved.ReservedCPUs)
+			allCPUs := k8scpuset.New()
+			for cpuID := range sharedPoolCPUs {
+				allCPUs = allCPUs.Union(k8scpuset.New(int(cpuID)))
+			}
+			allocatableCPUs := allCPUs
+			if nodeAnnoReserved.Size() > 0 {
+				reservedK8s, _ := k8scpuset.Parse(reserved.ReservedCPUs)
+				allocatableCPUs = allCPUs.Difference(reservedK8s)
+			}
+			for numaID, s := range strat.PerNUMA {
+				cpusInNUMANode := topo.CPUDetails.CPUsInNUMANodes(int(numaID)).Intersection(allocatableCPUs)
+				if cpusInNUMANode.Size() == 0 {
+					continue
+				}
+				dedicatedTotal := int(s.InstanceCap * s.DedicatedCores)
+				sharedTotal := cpusInNUMANode.Size() - dedicatedTotal
+				n := int(s.SharedCores)
+				if dedicatedTotal > 0 && sharedTotal >= n {
+					dedicatedSet, err := kubelet.TakeByTopology(cpusInNUMANode, dedicatedTotal, topo)
+					if err == nil && dedicatedSet.Size() > 0 {
+						for _, cpuID := range dedicatedSet.UnsortedList() {
+							delete(sharedPoolCPUs, int32(cpuID))
+						}
+						klog.V(5).Infof("excluded m+n dedicated %v (NUMA %d) from LS share pool", dedicatedSet.String(), numaID)
+					}
+				}
+			}
+		}
 	}
 
 	lsSharePools, beSharePools := s.calCPUSharePools(sharedPoolCPUs)
@@ -386,8 +462,8 @@ func (s *nodeTopoInformer) calcNodeTopo() (*nodeTopologyStatus, error) {
 	if len(systemQOSJson) != 0 {
 		nodeTopoStatus.Annotations[extension.AnnotationNodeSystemQOSResource] = string(systemQOSJson)
 	}
-	// sync m+n strategy from node label to NRT annotations for cpuset rule
-	if s := node.Labels[extension.LabelNodeCPUExclusiveSharedStrategy]; s != "" {
+	// sync m+n strategy from node annotation to NRT annotations for cpuset rule.
+	if s := node.Annotations[extension.LabelNodeCPUExclusiveSharedStrategy]; s != "" {
 		nodeTopoStatus.Annotations[extension.LabelNodeCPUExclusiveSharedStrategy] = s
 	}
 
@@ -862,6 +938,52 @@ func (s *nodeTopoInformer) calKubeletAllocatedCPUs(sharePoolCPUs map[int32]*exte
 		return nil, fmt.Errorf("failed to cal GuaranteedCpu, err: %v", err)
 	}
 	return podAllocs, nil
+}
+
+// calLSRLSECPUsFromCgroup returns PodCPUAlloc for LSR/LSE pods that have cpuset in cgroup
+// but no resource-status annotation (e.g. m+n allocated by cpuset rule).
+// This ensures NRT pod-cpu-allocs includes m+n allocations when kubelet policy is "none".
+func (s *nodeTopoInformer) calLSRLSECPUsFromCgroup() []extension.PodCPUAlloc {
+	cgroupReader := resourceexecutor.NewCgroupReader()
+	var allocs []extension.PodCPUAlloc
+	for _, podMeta := range s.podsInformer.GetAllPods() {
+		qos := extension.GetPodQoSClassRaw(podMeta.Pod)
+		if qos != extension.QoSLSR && qos != extension.QoSLSE {
+			continue
+		}
+		if alloc, err := extension.GetResourceStatus(podMeta.Pod.Annotations); err == nil && alloc != nil && alloc.CPUSet != "" {
+			continue
+		}
+		if podMeta.Pod == nil || len(podMeta.Pod.Status.ContainerStatuses) == 0 {
+			continue
+		}
+		podCpuset := cpuset.NewCPUSet()
+		for i := range podMeta.Pod.Status.ContainerStatuses {
+			cs := &podMeta.Pod.Status.ContainerStatuses[i]
+			if cs.ContainerID == "" {
+				continue
+			}
+			containerDir, err := koordletutil.GetContainerCgroupParentDir(podMeta.CgroupDir, cs)
+			if err != nil {
+				continue
+			}
+			cpuSet, err := cgroupReader.ReadCPUSet(containerDir)
+			if err != nil || cpuSet == nil || cpuSet.Size() == 0 {
+				continue
+			}
+			podCpuset = podCpuset.Union(*cpuSet)
+		}
+		if podCpuset.Size() > 0 {
+			allocs = append(allocs, extension.PodCPUAlloc{
+				UID:              podMeta.Pod.UID,
+				Namespace:        podMeta.Pod.Namespace,
+				Name:             podMeta.Pod.Name,
+				CPUSet:           podCpuset.String(),
+				ManagedByKubelet: false,
+			})
+		}
+	}
+	return allocs
 }
 
 func (s *nodeTopoInformer) updateNodeTopo(newTopo *v1alpha1.NodeResourceTopology) {

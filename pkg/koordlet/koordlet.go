@@ -58,6 +58,7 @@ func init() {
 
 type Daemon interface {
 	Run(stopCh <-chan struct{})
+	StatesInformer() statesinformer.StatesInformer
 }
 
 type daemon struct {
@@ -207,4 +208,8 @@ func (d *daemon) Run(stopCh <-chan struct{}) {
 	klog.Info("Start daemon successfully")
 	<-stopCh
 	klog.Info("Shutting down daemon")
+}
+
+func (d *daemon) StatesInformer() statesinformer.StatesInformer {
+	return d.statesInformer
 }

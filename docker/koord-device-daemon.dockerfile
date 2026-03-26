@@ -6,6 +6,7 @@ ARG TARGETARCH
 ENV VERSION $VERSION
 ENV GOOS linux
 ENV GOARCH $TARGETARCH
+ENV GOPROXY=https://goproxy.cn,direct
 
 RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true && \

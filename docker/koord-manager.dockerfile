@@ -6,6 +6,7 @@ ARG TARGETARCH
 ENV VERSION $VERSION
 ENV GOOS linux
 ENV GOARCH $TARGETARCH
+ENV GOPROXY=https://goproxy.cn,direct
 
 COPY go.mod go.mod
 COPY go.sum go.sum
@@ -18,7 +19,7 @@ COPY pkg/ pkg/
 
 RUN CGO_ENABLED=0 go build -a -o koord-manager cmd/koord-manager/main.go
 
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/static:latest
+FROM --platform=$TARGETPLATFORM alpine:3.22.3
 WORKDIR /
 COPY --from=builder /go/src/github.com/koordinator-sh/koordinator/koord-manager .
 ENTRYPOINT ["/koord-manager"]

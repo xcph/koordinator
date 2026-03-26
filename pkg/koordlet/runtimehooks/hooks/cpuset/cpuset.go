@@ -45,6 +45,7 @@ type cpusetPlugin struct {
 	ruleRWMutex          sync.RWMutex
 	executor             resourceexecutor.ResourceUpdateExecutor
 	disableUnsetCPUQuota bool
+	statesInformer       statesinformer.StatesInformer
 }
 
 var (
@@ -55,6 +56,7 @@ var (
 func (p *cpusetPlugin) Register(op hooks.Options) {
 	klog.V(5).Infof("register hook %v", name)
 	p.disableUnsetCPUQuota = op.DisableUnsetCPUQuotaForCPUSetPod
+	p.statesInformer = op.StatesInformer
 	hooks.Register(rmconfig.PreCreateContainer, name, description, p.SetContainerCPUSetAndUnsetCFS)
 	hooks.Register(rmconfig.PreUpdateContainerResources, name, description, p.SetContainerCPUSetAndUnsetCFS)
 	hooks.Register(rmconfig.PreRunPodSandbox, name, "unset pod cpu quota if needed", p.UnsetPodCPUQuota)
@@ -86,6 +88,13 @@ func (p *cpusetPlugin) Register(op hooks.Options) {
 
 var singleton *cpusetPlugin
 
+// SyncCpusetMPlusNCheckpoint periodically syncs /var/lib/koordlet/cpuset_m_plus_n_state
+// by releasing stale checkpoint entries for removed pods. Call this on a timer to keep
+// the checkpoint clean and allocation correct.
+func SyncCpusetMPlusNCheckpoint() {
+	Object().releaseStaleForMPlusN()
+}
+
 func Object() *cpusetPlugin {
 	if singleton == nil {
 		singleton = &cpusetPlugin{}
@@ -112,7 +121,25 @@ func (p *cpusetPlugin) SetContainerCPUSet(proto protocol.HooksProtocol) error {
 	containerReq := containerCtx.Request
 	klog.V(5).Infof("getting container cpuset for %v/%v", containerReq.PodMeta.String(), containerReq.ContainerMeta.Name)
 
-	// cpuset from pod annotation (LSE, LSR)
+	r := p.getRule()
+	var ruleCpuset *string
+	if r != nil {
+		var err error
+		ruleCpuset, err = r.getContainerCPUSet(&containerReq)
+		if err != nil {
+			return err
+		}
+		// Rule first: m+n for LSR/LSE takes precedence over scheduler's resource-status.
+		// Scheduler may write single-CPU cpuset (e.g. "0") which overrides m+n allocation.
+		if ruleCpuset != nil && *ruleCpuset != "" {
+			containerCtx.Response.Resources.CPUSet = ruleCpuset
+			klog.V(5).Infof("get cpuset %v for container %v/%v from rule", *ruleCpuset,
+				containerCtx.Request.PodMeta.String(), containerCtx.Request.ContainerMeta.Name)
+			return nil
+		}
+	}
+
+	// cpuset from pod annotation (LSE, LSR) - scheduler allocation when rule returns empty
 	if cpusetVal, err := util.GetCPUSetFromPod(containerReq.PodAnnotations); err != nil {
 		return err
 	} else if cpusetVal != "" {
@@ -122,25 +149,19 @@ func (p *cpusetPlugin) SetContainerCPUSet(proto protocol.HooksProtocol) error {
 		return nil
 	}
 
-	r := p.getRule()
 	if r == nil {
 		klog.V(5).Infof("hook plugin rule is nil, nothing to do for plugin %v", name)
 		return nil
 	}
 
-	// cpuset from rule according to pod QoS
-	cpusetValue, err := r.getContainerCPUSet(&containerReq)
-	if err != nil {
-		return err
-	}
-	if cpusetValue != nil {
-		klog.V(5).Infof("get cpuset %v for container %v/%v from rule", *cpusetValue,
+	if ruleCpuset != nil {
+		klog.V(5).Infof("get cpuset %v for container %v/%v from rule", *ruleCpuset,
 			containerCtx.Request.PodMeta.String(), containerCtx.Request.ContainerMeta.Name)
 	} else {
 		klog.V(5).Infof("get empty cpuset for container %v/%v from rule",
 			containerCtx.Request.PodMeta.String(), containerCtx.Request.ContainerMeta.Name)
 	}
-	containerCtx.Response.Resources.CPUSet = cpusetValue
+	containerCtx.Response.Resources.CPUSet = ruleCpuset
 	return nil
 }
 

@@ -40,14 +40,24 @@ import (
 	"github.com/koordinator-sh/koordinator/pkg/util"
 )
 
+// mPlusNAllocatorInterface is implemented by both Allocator and PerNUMAAllocator.
+type mPlusNAllocatorInterface interface {
+	Allocate(podUID types.UID, m, n int) (cpuset.CPUSet, error)
+	ReleaseStale(keepUIDs map[types.UID]struct{})
+}
+
 type cpusetRule struct {
 	kubeletPolicy   extension.KubeletCPUManagerPolicy
 	sharePools      []extension.CPUSharedPool
 	beSharePools    []extension.CPUSharedPool
 	systemQOSCPUSet string
 	// m+n allocation
-	mPlusNAllocator *cpusetalloc.Allocator
+	mPlusNAllocator mPlusNAllocatorInterface
 	strategy        *extension.CPUExclusiveSharedStrategy
+	parsedStrategy  *extension.ParsedCPUExclusiveSharedStrategy
+	// releaseStaleBeforeAllocate clears checkpoint entries for removed pods before allocating.
+	// Needed because PreCreateContainer/runtime hook can run before ruleUpdateCb, leaving stale entries.
+	releaseStaleBeforeAllocate func()
 	// TODO: support per-node disable
 }
 
@@ -65,23 +75,52 @@ func (r *cpusetRule) getContainerCPUSet(containerReq *protocol.ContainerRequest)
 	podAnnotations := containerReq.PodAnnotations
 	podLabels := containerReq.PodLabels
 
-	// m+n allocation: pod with cpu-exclusive-cores gets m dedicated + n shared
-	if m, ok := extension.GetPodCPUExclusiveCores(podAnnotations); ok && r.mPlusNAllocator != nil {
-		n := int32(0)
-		if nVal, hasN := extension.GetPodCPUSharedCores(podAnnotations); hasN {
-			n = nVal
-		} else if r.strategy != nil {
-			n = r.strategy.SharedCores
+	// m+n allocation: Koordinator forces m+n cpuset onto pods according to node cpuExclusiveSharedStrategy.
+	// 1) Pod annotation cpu-exclusive-cores: m from pod, n from pod or strategy.
+	// 2) Pod with LSR/LSE QoS and no annotation: m and n from node strategy (forced by Koordinator).
+	// For per-NUMA strategy, pass m=0,n=0 so allocator uses the NUMA's own m,n.
+	hasStrategy := r.strategy != nil || (r.parsedStrategy != nil && r.parsedStrategy.PerNUMA != nil)
+	if r.mPlusNAllocator != nil && hasStrategy {
+		var m, n int32
+		usePerNUMAStrategy := r.parsedStrategy != nil && r.parsedStrategy.PerNUMA != nil
+		if podM, ok := extension.GetPodCPUExclusiveCores(podAnnotations); ok {
+			m = podM
+			if podN, hasN := extension.GetPodCPUSharedCores(podAnnotations); hasN {
+				n = podN
+			} else if r.strategy != nil {
+				n = r.strategy.SharedCores
+			} else if usePerNUMAStrategy {
+				for _, s := range r.parsedStrategy.PerNUMA {
+					n = s.SharedCores
+					break
+				}
+			}
+		} else {
+			podQOS := extension.GetQoSClassByAttrs(podLabels, podAnnotations)
+			if podQOS == extension.QoSLSR || podQOS == extension.QoSLSE {
+				if usePerNUMAStrategy {
+					m, n = 0, 0 // allocator uses per-NUMA strategy
+				} else if r.strategy != nil {
+					m = r.strategy.DedicatedCores
+					n = r.strategy.SharedCores
+				}
+			}
 		}
-		if cpusetVal, err := r.mPlusNAllocator.Allocate(types.UID(containerReq.PodMeta.UID), int(m), int(n)); err != nil {
-			klog.V(4).Infof("m+n allocator failed for container %v/%v: %v",
-				containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, err)
-			return nil, err
-		} else if cpusetVal.Size() > 0 {
-			s := cpusetVal.String()
-			klog.V(6).Infof("get cpuset from m+n allocator for container %v/%v: %v",
-				containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, s)
-			return ptr.To[string](s), nil
+		shouldAllocate := m > 0 || (usePerNUMAStrategy && m == 0 && n == 0)
+		if shouldAllocate {
+			if r.releaseStaleBeforeAllocate != nil {
+				r.releaseStaleBeforeAllocate()
+			}
+			if cpusetVal, err := r.mPlusNAllocator.Allocate(types.UID(containerReq.PodMeta.UID), int(m), int(n)); err != nil {
+				klog.V(4).Infof("m+n allocator failed for container %v/%v: %v",
+					containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, err)
+				return nil, err
+			} else if cpusetVal.Size() > 0 {
+				s := cpusetVal.String()
+				klog.V(6).Infof("get cpuset from m+n allocator for container %v/%v: %v",
+					containerReq.PodMeta.String(), containerReq.ContainerMeta.Name, s)
+				return ptr.To[string](s), nil
+			}
 		}
 	}
 
@@ -188,9 +227,27 @@ func (r *cpusetRule) getHostAppCpuset(hostAppReq *protocol.HostAppRequest) (*str
 	return ptr.To[string](strings.Join(allSharePoolCPUs, ",")), nil
 }
 
+// getReservedCPUsFromNRT returns reserved CPUs from NRT annotations (node reservation + kubelet policy).
+func getReservedCPUsFromNRT(annotations map[string]string) cpuset.CPUSet {
+	reserved := cpuset.New()
+	// From node.koordinator.sh/reservation (e.g. {"reservedCPUs":"0-1"})
+	if s, _ := extension.GetReservedCPUs(annotations); s != "" {
+		if c, err := cpuset.Parse(s); err == nil {
+			reserved = reserved.Union(c)
+		}
+	}
+	// From kubelet.koordinator.sh/cpu-manager-policy (when kubelet has reserved-cpus)
+	if policy, err := extension.GetKubeletCPUManagerPolicy(annotations); err == nil && policy != nil && policy.ReservedCPUs != "" {
+		if c, err := cpuset.Parse(policy.ReservedCPUs); err == nil {
+			reserved = reserved.Union(c)
+		}
+	}
+	return reserved
+}
+
 func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
 	nodeTopo, ok := nodeTopoIf.(*topov1alpha1.NodeResourceTopology)
-	if !ok {
+	if !ok || nodeTopo == nil {
 		return false, fmt.Errorf("parse format for hook plugin %v failed, expect: %v, got: %T",
 			name, "*topov1alpha1.NodeResourceTopology", nodeTopoIf)
 	}
@@ -198,6 +255,13 @@ func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// Debug: trace have-0 root cause
+	cpuSharePoolsAnno := ""
+	if nodeTopo.Annotations != nil {
+		cpuSharePoolsAnno = nodeTopo.Annotations[extension.AnnotationNodeCPUSharedPools]
+	}
+	klog.V(4).Infof("m+n debug: cpuSharePools len=%d, annotation len=%d, raw=%q",
+		len(cpuSharePools), len(cpuSharePoolsAnno), cpuSharePoolsAnno)
 	beCPUSharePools, err := extension.GetNodeBECPUSharePools(nodeTopo.Annotations)
 	if err != nil {
 		return false, err
@@ -242,10 +306,14 @@ func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
 	metrics.RecordCPUSetSharePoolCores(float64(shareCPUSetCount))
 	metrics.RecordCPUSetBESharePoolCores(float64(beShareCPUSetCount))
 
-	var mPlusNAlloc *cpusetalloc.Allocator
+	var mPlusNAlloc mPlusNAllocatorInterface
 	var strategy *extension.CPUExclusiveSharedStrategy
-	if strat, ok := extension.ParseNodeCPUExclusiveSharedStrategy(nodeTopo.Annotations); ok {
-		strategy = strat
+	var parsedStrategy *extension.ParsedCPUExclusiveSharedStrategy
+	if parsed, ok := extension.ParseNodeCPUExclusiveSharedStrategy(nodeTopo.Annotations); ok {
+		parsedStrategy = parsed
+		if parsed.WholeNode != nil {
+			strategy = parsed.WholeNode
+		}
 		extTopo, err := extension.GetCPUTopology(nodeTopo.Annotations)
 		if err != nil {
 			klog.V(4).Infof("m+n: failed to get cpu topology: %v", err)
@@ -256,31 +324,192 @@ func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
 				allCPUList = append(allCPUList, int(c.ID))
 			}
 			allCPUsSet := cpuset.New(allCPUList...)
-			sharedSet := cpuset.New()
-			for _, pool := range cpuSharePools {
-				poolSet, err := cpuset.Parse(pool.CPUSet)
-				if err != nil {
-					continue
-				}
-				sharedSet = sharedSet.Union(poolSet)
+
+			reservedCPUs := getReservedCPUsFromNRT(nodeTopo.Annotations)
+			allocatableCPUs := allCPUsSet
+			if reservedCPUs.Size() > 0 {
+				allocatableCPUs = allCPUsSet.Difference(reservedCPUs)
+				klog.V(4).Infof("m+n: excluding reserved CPUs %v, allocatable %v", reservedCPUs.String(), allocatableCPUs.String())
 			}
-			dedicatedSet := allCPUsSet.Difference(sharedSet)
-			checkpointPath := kubelet.GetCPUSetMPlusNStateFilePath(system.Conf.VarLibKubeletRootDir)
-			mPlusNAlloc = cpusetalloc.NewAllocator(dedicatedSet, sharedSet, topo, checkpointPath)
-			klog.V(4).Infof("m+n allocator created: dedicated %v, shared %v", dedicatedSet.String(), sharedSet.String())
+
+			checkpointPath := kubelet.GetCPUSetMPlusNStateFilePath(system.Conf.GetCpusetCheckpointRoot())
+
+			if parsed.PerNUMA != nil {
+				// Per-NUMA: build pools for each NUMA
+				numaPools := make(map[int32]struct {
+					DedicatedSet cpuset.CPUSet
+					SharedSet    cpuset.CPUSet
+					SharedPools  []cpuset.CPUSet
+				})
+				for numaID, strat := range parsed.PerNUMA {
+					cpusInNUMANode := topo.CPUDetails.CPUsInNUMANodes(int(numaID)).Intersection(allocatableCPUs)
+					if cpusInNUMANode.Size() == 0 {
+						klog.V(4).Infof("m+n per-NUMA: NUMA %d has no allocatable CPUs, skip", numaID)
+						continue
+					}
+					totalCPUs := cpusInNUMANode.Size()
+					dedicatedTotal := int(strat.InstanceCap * strat.DedicatedCores)
+					sharedTotal := totalCPUs - dedicatedTotal
+					n := int(strat.SharedCores)
+
+					var dedicatedSet, sharedSet cpuset.CPUSet
+					var sharedPools []cpuset.CPUSet
+					if dedicatedTotal > 0 && sharedTotal > 0 && n > 0 && sharedTotal >= n {
+						dedicatedSet, err = kubelet.TakeByTopology(cpusInNUMANode, dedicatedTotal, topo)
+						if err != nil {
+							klog.V(4).Infof("m+n per-NUMA: TakeByTopology for NUMA %d failed: %v", numaID, err)
+							continue
+						}
+						sharedSet = cpusInNUMANode.Difference(dedicatedSet)
+						numPools := sharedTotal / n
+						if numPools > 1 {
+							remaining := sharedSet
+							for i := 0; i < numPools && remaining.Size() >= n; i++ {
+								pool, err := kubelet.TakeByTopology(remaining, n, topo)
+								if err != nil {
+									break
+								}
+								sharedPools = append(sharedPools, pool)
+								remaining = remaining.Difference(pool)
+							}
+						}
+					}
+					if dedicatedSet.Size() > 0 {
+						numaPools[numaID] = struct {
+							DedicatedSet cpuset.CPUSet
+							SharedSet    cpuset.CPUSet
+							SharedPools  []cpuset.CPUSet
+						}{DedicatedSet: dedicatedSet, SharedSet: sharedSet, SharedPools: sharedPools}
+					}
+				}
+				if len(numaPools) > 0 {
+					mPlusNAlloc = cpusetalloc.NewPerNUMAAllocator(numaPools, parsed.PerNUMA, topo, checkpointPath)
+					klog.V(4).Infof("m+n per-NUMA allocator created: %d NUMA nodes", len(numaPools))
+				}
+			} else if strategy != nil {
+				// Whole-node legacy
+				strat := strategy
+				totalCPUs := allocatableCPUs.Size()
+				dedicatedTotal := int(strat.InstanceCap * strat.DedicatedCores)
+				sharedTotal := totalCPUs - dedicatedTotal
+				n := int(strat.SharedCores)
+
+				var dedicatedSet, sharedSet cpuset.CPUSet
+				var sharedPools []cpuset.CPUSet
+
+				if dedicatedTotal > 0 && sharedTotal > 0 && n > 0 && sharedTotal >= n {
+					dedicatedSet, err = kubelet.TakeByTopology(allocatableCPUs, dedicatedTotal, topo)
+					if err != nil {
+						klog.V(4).Infof("m+n: TakeByTopology for dedicated failed: %v", err)
+					} else {
+						sharedSet = allocatableCPUs.Difference(dedicatedSet)
+						numPools := sharedTotal / n
+						if numPools > 1 {
+							remaining := sharedSet
+							for i := 0; i < numPools && remaining.Size() >= n; i++ {
+								pool, err := kubelet.TakeByTopology(remaining, n, topo)
+								if err != nil {
+									break
+								}
+								sharedPools = append(sharedPools, pool)
+								remaining = remaining.Difference(pool)
+							}
+							klog.V(4).Infof("m+n: split shared into %d pools for round-robin", len(sharedPools))
+						}
+					}
+				}
+
+				if dedicatedSet.Size() == 0 {
+					// Fallback: use cpuSharePools from NRT (LS share pool, excludes m+n dedicated)
+					klog.V(4).Infof("m+n debug: TakeByTopology failed, fallback to cpuSharePools (len=%d)", len(cpuSharePools))
+					sharedSet = cpuset.New()
+					for _, pool := range cpuSharePools {
+						poolSet, err := cpuset.Parse(pool.CPUSet)
+						if err != nil {
+							klog.V(4).Infof("m+n debug: failed to parse pool %v: %v", pool, err)
+							continue
+						}
+						sharedSet = sharedSet.Union(poolSet)
+					}
+					klog.V(4).Infof("m+n debug: fallback sharedSet=%v, allocatableCPUs=%v", sharedSet.String(), allocatableCPUs.String())
+					dedicatedSet = allocatableCPUs.Difference(sharedSet)
+					// If cpuSharePools was empty (e.g. rule ran before NRT update), sharedSet is empty
+					// and dedicatedSet=allocatableCPUs, causing allocator with empty sharedPool.
+					// Retry TakeByTopology to compute dedicated+shared from allocatableCPUs.
+					if sharedSet.Size() == 0 && dedicatedTotal > 0 && sharedTotal >= n {
+						dedicatedSet, err = kubelet.TakeByTopology(allocatableCPUs, dedicatedTotal, topo)
+						if err == nil && dedicatedSet.Size() > 0 {
+							sharedSet = allocatableCPUs.Difference(dedicatedSet)
+							klog.V(4).Infof("m+n fallback: recomputed dedicated %v, shared %v from TakeByTopology",
+								dedicatedSet.String(), sharedSet.String())
+						}
+					}
+				}
+
+				// Do not create allocator when sharedSet is empty but n>0 (would fail with "have 0")
+				// Use sharedPools mode when sharedSet has cores: single-pool mode "consumes" shared per pod
+				// (availableShared = shared - allocated), so the 2nd+ pod gets "have 0". sharedPools mode
+				// assigns the whole pool to each instance (round-robin), allowing multiple pods to share.
+				if sharedSet.Size() > 0 && len(sharedPools) == 0 {
+					sharedPools = []cpuset.CPUSet{sharedSet}
+				}
+				if dedicatedSet.Size() > 0 && (sharedSet.Size() > 0 || len(sharedPools) > 0 || n == 0) {
+					if len(sharedPools) > 0 {
+						mPlusNAlloc = cpusetalloc.NewAllocatorWithSharedPools(dedicatedSet, sharedPools, topo, checkpointPath)
+						klog.V(4).Infof("m+n allocator created (multi-pool): dedicated %v, %d shared pools for round-robin",
+							dedicatedSet.String(), len(sharedPools))
+					} else {
+						mPlusNAlloc = cpusetalloc.NewAllocator(dedicatedSet, sharedSet, topo, checkpointPath)
+						klog.V(4).Infof("m+n allocator created: dedicated %v, shared %v", dedicatedSet.String(), sharedSet.String())
+					}
+				} else if dedicatedSet.Size() > 0 && sharedSet.Size() == 0 && n > 0 {
+					klog.Warningf("m+n: skip creating allocator - sharedSet empty but need %d shared cores (allocatable %v, dedicated %v, cpuSharePools len=%d)",
+						n, allocatableCPUs.String(), dedicatedSet.String(), len(cpuSharePools))
+				}
+			}
 		}
 	}
 
+	releaseStaleFn := func() {}
+	if mPlusNAlloc != nil && p.statesInformer != nil {
+		releaseStaleFn = func() { p.releaseStaleForMPlusN() }
+	}
 	newRule := &cpusetRule{
-		kubeletPolicy:   *cpuManagerPolicy,
-		sharePools:      cpuSharePools,
-		beSharePools:    beCPUSharePools,
-		systemQOSCPUSet: systemQOSCPUSet,
-		mPlusNAllocator: mPlusNAlloc,
-		strategy:        strategy,
+		kubeletPolicy:               *cpuManagerPolicy,
+		sharePools:                  cpuSharePools,
+		beSharePools:                beCPUSharePools,
+		systemQOSCPUSet:             systemQOSCPUSet,
+		mPlusNAllocator:             mPlusNAlloc,
+		strategy:                    strategy,
+		parsedStrategy:              parsedStrategy,
+		releaseStaleBeforeAllocate:  releaseStaleFn,
 	}
 	updated := p.updateRule(newRule)
 	return updated, nil
+}
+
+// releaseStaleForMPlusN clears checkpoint entries for removed pods before allocating.
+// Called from PreCreateContainer path where ruleUpdateCb may not have run yet.
+func (p *cpusetPlugin) releaseStaleForMPlusN() {
+	hasStrategy := func(r *cpusetRule) bool {
+		return r != nil && (r.strategy != nil || (r.parsedStrategy != nil && r.parsedStrategy.PerNUMA != nil))
+	}
+	r := p.getRule()
+	if r == nil || r.mPlusNAllocator == nil || !hasStrategy(r) {
+		return
+	}
+	keepUIDs := make(map[types.UID]struct{})
+	for _, podMeta := range p.statesInformer.GetAllPods() {
+		if _, ok := extension.GetPodCPUExclusiveCores(podMeta.Pod.Annotations); ok {
+			keepUIDs[types.UID(podMeta.Pod.UID)] = struct{}{}
+		} else {
+			qos := extension.GetQoSClassByAttrs(podMeta.Pod.Labels, podMeta.Pod.Annotations)
+			if qos == extension.QoSLSR || qos == extension.QoSLSE {
+				keepUIDs[types.UID(podMeta.Pod.UID)] = struct{}{}
+			}
+		}
+	}
+	r.mPlusNAllocator.ReleaseStale(keepUIDs)
 }
 
 func (p *cpusetPlugin) ruleUpdateCb(target *statesinformer.CallbackTarget) error {
@@ -288,12 +517,20 @@ func (p *cpusetPlugin) ruleUpdateCb(target *statesinformer.CallbackTarget) error
 		klog.Warningf("callback target is nil")
 		return nil
 	}
-	// release m+n allocations for removed pods
-	if r := p.getRule(); r != nil && r.mPlusNAllocator != nil {
+	// release m+n allocations for removed pods (annotation or LSR/LSE with strategy)
+	hasStrategy := func(r *cpusetRule) bool {
+		return r != nil && (r.strategy != nil || (r.parsedStrategy != nil && r.parsedStrategy.PerNUMA != nil))
+	}
+	if r := p.getRule(); r != nil && r.mPlusNAllocator != nil && hasStrategy(r) {
 		keepUIDs := make(map[types.UID]struct{})
 		for _, podMeta := range target.Pods {
 			if _, ok := extension.GetPodCPUExclusiveCores(podMeta.Pod.Annotations); ok {
 				keepUIDs[types.UID(podMeta.Pod.UID)] = struct{}{}
+			} else {
+				qos := extension.GetQoSClassByAttrs(podMeta.Pod.Labels, podMeta.Pod.Annotations)
+				if qos == extension.QoSLSR || qos == extension.QoSLSE {
+					keepUIDs[types.UID(podMeta.Pod.UID)] = struct{}{}
+				}
 			}
 		}
 		r.mPlusNAllocator.ReleaseStale(keepUIDs)

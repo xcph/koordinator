@@ -18,6 +18,7 @@ package runtimehooks
 
 import (
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
@@ -30,6 +31,7 @@ import (
 	"github.com/koordinator-sh/koordinator/pkg/features"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/resourceexecutor"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/hooks"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/hooks/cpuset"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/nri"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/proxyserver"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/runtimehooks/reconciler"
@@ -81,6 +83,20 @@ func (r *runtimeHook) Run(stopCh <-chan struct{}) error {
 	if err := r.server.Register(); err != nil {
 		return err
 	}
+	// Periodically sync cpuset_m_plus_n_state checkpoint to release stale entries and keep allocation correct
+	go func() {
+		cpuset.SyncCpusetMPlusNCheckpoint() // run once at startup
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				cpuset.SyncCpusetMPlusNCheckpoint()
+			case <-stopCh:
+				return
+			}
+		}
+	}()
 	klog.V(5).Infof("runtime hook server has started")
 	<-stopCh
 	klog.Infof("runtime hook is stopped")

@@ -32,6 +32,7 @@ import (
 	agent "github.com/koordinator-sh/koordinator/pkg/koordlet"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/audit"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/config"
+	"github.com/koordinator-sh/koordinator/pkg/koordlet/cpusetstate"
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/metrics"
 	metricsutil "github.com/koordinator-sh/koordinator/pkg/util/metrics"
 )
@@ -76,6 +77,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Unable to setup koordlet daemon: %v", err)
 	}
+	cpusetstate.SetStatesInformer(d.StatesInformer())
 
 	// Expose the Prometheus http endpoint
 	go installHTTPHandler()

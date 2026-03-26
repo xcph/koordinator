@@ -242,6 +242,9 @@ func (s *podsInformer) syncPods() error {
 	s.podHasSynced.Store(true)
 	s.podUpdatedTime = time.Now()
 	klog.V(4).Infof("get pods success, len %d, time %s", len(s.podMap), s.podUpdatedTime.String())
+	// Trigger NodeTopology first so cpuset rule re-parses with latest GetNodeTopo() before
+	// reconciler runs (triggered by AllPods). Fixes "have 0" when rule was stale.
+	s.callbackRunner.SendCallback(statesinformer.RegisterTypeNodeTopology)
 	s.callbackRunner.SendCallback(statesinformer.RegisterTypeAllPods)
 	return nil
 }
