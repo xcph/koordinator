@@ -18,7 +18,6 @@ package cpuset
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
 	topov1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
@@ -605,11 +604,14 @@ func (p *cpusetPlugin) getRule() *cpusetRule {
 }
 
 func (p *cpusetPlugin) updateRule(newRule *cpusetRule) bool {
-	p.ruleRWMutex.RLock()
-	defer p.ruleRWMutex.RUnlock()
-	if !reflect.DeepEqual(newRule, p.rule) {
-		p.rule = newRule
-		return true
+	p.ruleRWMutex.Lock()
+	defer p.ruleRWMutex.Unlock()
+	// Avoid reflect.DeepEqual on rule internals (maps/pointers/functions), which can
+	// panic with "concurrent map read and map write" under async callback updates.
+	// Replacing rule atomically is safe and keeps hook behavior deterministic.
+	if p.rule == nil && newRule == nil {
+		return false
 	}
-	return false
+	p.rule = newRule
+	return true
 }
