@@ -31,6 +31,12 @@ vendor
 
 dist/
 
+# BuildKit / buildx（与 portgateway 一致）
+.buildkitd.effective.toml
+.buildkitd.endpoint.prev
+.buildkitd.config.prev
+.docker-config.buildkit
+
 README-contributing.md
 
 libpfm-*/
