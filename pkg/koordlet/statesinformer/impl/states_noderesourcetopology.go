@@ -854,7 +854,7 @@ func (s *nodeTopoInformer) calTopologyZoneList(nodeCPUInfo *metriccache.NodeCPUI
 	nodeNUMAInfoRaw, exist := s.metricCache.Get(metriccache.NodeNUMAInfoKey)
 	if !exist {
 		klog.Warning("failed to get node NUMA info, err: not exist")
-		return nil, fmt.Errorf("node cpu info not exist")
+		return nil, fmt.Errorf("node NUMA info not exist")
 	}
 	nodeNUMAInfo, ok := nodeNUMAInfoRaw.(*koordletutil.NodeNUMAInfo)
 	if !ok {

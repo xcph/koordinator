@@ -18,6 +18,7 @@ package util
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -342,6 +343,44 @@ DirectMap1G:    261095424 kB`
 	assert.Equal(t, uint64((263432804-256703236)<<10), got)
 	got = memInfo.MemUsageWithPageCache()
 	assert.Equal(t, uint64((263432804-254391744)<<10), got)
+}
+
+// TestGetNodeNUMAInfoSyntheticUMA covers UMA machines (no NUMA sysfs): empty NUMA dir or missing dir falls back to /proc/meminfo.
+func TestGetNodeNUMAInfoSyntheticUMA(t *testing.T) {
+	helper := system.NewFileTestUtil(t)
+	defer helper.Cleanup()
+	syntheticMem := `MemTotal:       8000000 kB
+MemFree:        4000000 kB
+MemAvailable:   7000000 kB
+`
+	helper.WriteProcSubFileContents(system.ProcMemInfoName, syntheticMem)
+
+	numaDir := system.GetSysNUMADir()
+	err := os.MkdirAll(numaDir, 0o755)
+	assert.NoError(t, err)
+
+	got, err := GetNodeNUMAInfo()
+	assert.NoError(t, err)
+	assert.Len(t, got.NUMAInfos, 1)
+	assert.Equal(t, int32(0), got.NUMAInfos[0].NUMANodeID)
+	assert.NotNil(t, got.NUMAInfos[0].MemInfo)
+	assert.Equal(t, uint64(8000000<<10), got.NUMAInfos[0].MemInfo.MemTotalBytes())
+}
+
+func TestGetNodeNUMAInfoMissingNUMADirSynthetic(t *testing.T) {
+	helper := system.NewFileTestUtil(t)
+	defer helper.Cleanup()
+	syntheticMem := `MemTotal:       9000000 kB
+MemFree:        4000000 kB
+MemAvailable:   8000000 kB
+`
+	helper.WriteProcSubFileContents(system.ProcMemInfoName, syntheticMem)
+
+	got, err := GetNodeNUMAInfo()
+	assert.NoError(t, err)
+	assert.Len(t, got.NUMAInfos, 1)
+	assert.Equal(t, int32(0), got.NUMAInfos[0].NUMANodeID)
+	assert.Equal(t, uint64(9000000<<10), got.NUMAInfos[0].MemInfo.MemTotalBytes())
 }
 
 func TestGetNUMAMemInfo(t *testing.T) {

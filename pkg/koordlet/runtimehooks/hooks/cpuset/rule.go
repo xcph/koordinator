@@ -17,7 +17,9 @@ limitations under the License.
 package cpuset
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	topov1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
@@ -244,9 +246,36 @@ func getReservedCPUsFromNRT(annotations map[string]string) cpuset.CPUSet {
 	return reserved
 }
 
+// tryCoerceNodeResourceTopology handles a duplicate Go type for *topology/v1alpha1.NodeResourceTopology (same
+// import path pulled twice). Unrelated types are rejected (Elem().Name() must be NodeResourceTopology).
+func tryCoerceNodeResourceTopology(nodeTopoIf interface{}) *topov1alpha1.NodeResourceTopology {
+	if nodeTopoIf == nil {
+		return nil
+	}
+	if nodeTopo, ok := nodeTopoIf.(*topov1alpha1.NodeResourceTopology); ok {
+		return nodeTopo
+	}
+	rt := reflect.TypeOf(nodeTopoIf)
+	if rt.Kind() != reflect.Ptr || rt.Elem().Name() != "NodeResourceTopology" {
+		return nil
+	}
+	data, err := json.Marshal(nodeTopoIf)
+	if err != nil {
+		klog.V(4).Infof("coerce NodeResourceTopology: marshal failed: %v", err)
+		return nil
+	}
+	var out topov1alpha1.NodeResourceTopology
+	if err := json.Unmarshal(data, &out); err != nil {
+		klog.V(4).Infof("coerce NodeResourceTopology: unmarshal failed: %v", err)
+		return nil
+	}
+	klog.V(4).Infof("coerced NodeResourceTopology via JSON (%T -> *topov1alpha1.NodeResourceTopology)", nodeTopoIf)
+	return &out
+}
+
 func (p *cpusetPlugin) parseRule(nodeTopoIf interface{}) (bool, error) {
-	nodeTopo, ok := nodeTopoIf.(*topov1alpha1.NodeResourceTopology)
-	if !ok || nodeTopo == nil {
+	nodeTopo := tryCoerceNodeResourceTopology(nodeTopoIf)
+	if nodeTopo == nil {
 		return false, fmt.Errorf("parse format for hook plugin %v failed, expect: %v, got: %T",
 			name, "*topov1alpha1.NodeResourceTopology", nodeTopoIf)
 	}

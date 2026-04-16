@@ -17,6 +17,7 @@ limitations under the License.
 package util
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -247,11 +248,32 @@ type NodeNUMAInfo struct {
 	HugePagesMap map[int32]map[uint64]*HugePagesInfo `json:"hugePagesMap,omitempty"`
 }
 
+// syntheticSingleNodeNUMAFromProcMemInfo builds a single logical NUMA node (id 0) from global /proc/meminfo.
+// Used on UMA systems (e.g. many ARM SoCs like RK3588) where /sys/devices/system/node is absent or empty.
+func syntheticSingleNodeNUMAFromProcMemInfo() (*NodeNUMAInfo, error) {
+	memInfoPath := system.GetProcFilePath(system.ProcMemInfoName)
+	memInfo, err := readMemInfo(memInfoPath, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build synthetic NUMA meminfo from %s: %w", memInfoPath, err)
+	}
+	klog.V(2).Infof("using synthetic single-node NUMA topology from %s (UMA / no NUMA sysfs)", memInfoPath)
+	return &NodeNUMAInfo{
+		NUMAInfos: []NUMAInfo{{
+			NUMANodeID: 0,
+			MemInfo:    memInfo,
+		}},
+		MemInfoMap: map[int32]*MemInfo{0: memInfo},
+	}, nil
+}
+
 // GetNodeNUMAInfo gets the node NUMA information with the pre-configured sysfs path.
 func GetNodeNUMAInfo() (*NodeNUMAInfo, error) {
 	numaNodeParentDir := system.GetSysNUMADir()
 	nodeDirs, err := os.ReadDir(numaNodeParentDir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return syntheticSingleNodeNUMAFromProcMemInfo()
+		}
 		return nil, fmt.Errorf("failed to read NUMA dir, err: %w", err)
 	}
 
@@ -305,6 +327,10 @@ func GetNodeNUMAInfo() (*NodeNUMAInfo, error) {
 	if len(result.NUMAInfos) != int(maxNodeID+1) {
 		return nil, fmt.Errorf("unexpected number of NUMA node, max ID %v, parsed %v",
 			maxNodeID, len(result.NUMAInfos))
+	}
+
+	if len(result.NUMAInfos) == 0 {
+		return syntheticSingleNodeNUMAFromProcMemInfo()
 	}
 
 	// sort NUMA infos by the order of node id
